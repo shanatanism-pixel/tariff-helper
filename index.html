@@ -89,36 +89,60 @@ let files=[],extra=[],ctl=null,maxImg=4,KEY='',MODEL='';
 // ---- the only code that talks to an AI: replace callModel/pickModel to add other providers ----
 const GB='https://generativelanguage.googleapis.com/v1beta/';
 const LS={get:k=>{try{return localStorage.getItem(k)||''}catch(e){return''}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}},del:k=>{try{localStorage.removeItem(k)}catch(e){}}};
-KEY=LS.get('gk');MODEL=LS.get('gm');
+let MODELS=[],TL=[],NOTHINK=false;
+KEY=LS.get('gk');MODEL=LS.get('gm');try{MODELS=JSON.parse(LS.get('gms')||'[]')}catch(e){}
+if(!MODELS.length&&MODEL)MODELS=[MODEL];
 if(KEY){$('key').value=KEY;$('ks').textContent='มีคีย์ที่บันทึกไว้แล้ว'+(MODEL?' · โมเดล '+MODEL:'');$('set').open=false}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function gfetch(url,opt){
   let r;try{r=await fetch(url,Object.assign({headers:{'x-goog-api-key':KEY,'Content-Type':'application/json'}},opt))}
   catch(e){if(e.name==='AbortError')throw e;const x=new Error('net');x.code='net';throw x}
-  if(!r.ok){const x=new Error('http');x.code=r.status===429?'rate':[400,401,403].includes(r.status)?'key':'http';x.status=r.status;try{x.msg=(await r.json()).error.message}catch(e){}throw x}
+  if(!r.ok){const x=new Error('http');x.status=r.status;try{x.msg=(await r.json()).error.message}catch(e){}
+    x.code=r.status===429?'rate':(r.status===401||r.status===403||(r.status===400&&/api key/i.test(x.msg||'')))?'key':r.status>=500?'busy':'http';throw x}
   return r.json();
 }
 async function pickModel(){
   const j=await gfetch(GB+'models?pageSize=200');
-  const ok=(j.models||[]).filter(m=>(m.supportedGenerationMethods||[]).includes('generateContent')&&/gemini-[\d.]+-flash$/.test(m.name));
-  const v=m=>parseFloat(m.name.match(/gemini-([\d.]+)-flash/)[1]);
+  const re=/gemini-([\d.]+)-flash(-lite)?$/;
+  const ok=(j.models||[]).filter(m=>(m.supportedGenerationMethods||[]).includes('generateContent')&&re.test(m.name));
+  const v=m=>{const x=m.name.match(re);return parseFloat(x[1])*10+(x[2]?0:1)};
   ok.sort((a,b)=>v(b)-v(a));
   if(!ok.length){const x=new Error('nomodel');x.code='nomodel';throw x}
-  return ok[0].name.replace('models/','');
+  return ok.slice(0,5).map(m=>m.name.replace('models/',''));
 }
-async function callModel(prompt,imgs){
+async function callModel(prompt,imgs,label){
   const parts=[{text:prompt}].concat((imgs||[]).map(d=>({inline_data:{mime_type:'image/jpeg',data:d}})));
-  const j=await gfetch(GB+'models/'+MODEL+':generateContent',{method:'POST',signal:ctl.signal,body:JSON.stringify({contents:[{role:'user',parts}],generationConfig:{responseMimeType:'application/json',temperature:0.2}})});
-  const c=j.candidates&&j.candidates[0],t=c&&c.content&&c.content.parts?c.content.parts.map(p=>p.text||'').join(''):'';
-  if(!t){const x=new Error('empty');x.code='empty';throw x}
-  try{return JSON.parse(t)}catch(e){const m=t.match(/\{[\s\S]*\}/);try{return JSON.parse(m[0])}catch(e2){const x=new Error('json');x.code='json';throw x}}
+  const order=[MODEL].concat(MODELS.filter(m=>m!==MODEL));
+  let last;const t0=Date.now();
+  for(const m of order){
+    for(let k=0;k<2;k++){
+      const gc={responseMimeType:'application/json',temperature:0.2};
+      if(/2\.5/.test(m)&&!NOTHINK)gc.thinkingConfig={thinkingBudget:1024};
+      try{
+        const j=await gfetch(GB+'models/'+m+':generateContent',{method:'POST',signal:ctl.signal,body:JSON.stringify({contents:[{role:'user',parts}],generationConfig:gc})});
+        const c=j.candidates&&j.candidates[0],t=c&&c.content&&c.content.parts?c.content.parts.map(p=>p.text||'').join(''):'';
+        if(!t){const x=new Error('empty');x.code='empty';throw x}
+        const u=j.usageMetadata||{};MODEL=m;
+        TL.push({l:label,m,ms:Date.now()-t0,pt:u.promptTokenCount,th:u.thoughtsTokenCount,ot:u.candidatesTokenCount});
+        try{return JSON.parse(t)}catch(e){const mm=t.match(/\{[\s\S]*\}/);try{return JSON.parse(mm[0])}catch(e2){const x=new Error('json');x.code='json';throw x}}
+      }catch(e){
+        last=e;if(e.name==='AbortError')throw e;
+        if(e.status===400&&/think/i.test(e.msg||'')&&!NOTHINK){NOTHINK=true;k--;continue}
+        if(e.code==='busy'&&k===0){await sleep(2500);continue}
+        break;
+      }
+    }
+    if(!(last.code==='busy'||last.code==='rate'||last.status===404))throw last;
+  }
+  throw last;
 }
 $('save').onclick=async()=>{
   const k=$('key').value.trim();if(!k){$('ks').textContent='วางคีย์ก่อน';return}
   KEY=k;$('ks').textContent='กำลังทดสอบ…';
-  try{MODEL=await pickModel();LS.set('gk',KEY);LS.set('gm',MODEL);$('ks').textContent='ใช้ได้ ✓ โมเดลที่ใช้: '+MODEL}
-  catch(e){KEY='';MODEL='';$('ks').textContent=(ERR[e.code]||'ทดสอบไม่สำเร็จ')+(e.msg?' ['+e.msg.slice(0,140)+']':'')}
+  try{MODELS=await pickModel();MODEL=MODELS[0];LS.set('gk',KEY);LS.set('gm',MODEL);LS.set('gms',JSON.stringify(MODELS));$('ks').textContent='ใช้ได้ ✓ โมเดลที่ใช้ได้: '+MODELS.join(', ')+' (ถ้าตัวแรกคนใช้หนาแน่น ระบบสลับตัวถัดไปให้เอง)'}
+  catch(e){KEY='';MODEL='';MODELS=[];$('ks').textContent=(ERR[e.code]||'ทดสอบไม่สำเร็จ')+(e.msg?' ['+e.msg.slice(0,140)+']':'')}
 };
-$('del').onclick=()=>{LS.del('gk');LS.del('gm');KEY='';MODEL='';$('key').value='';$('ks').textContent='ลบคีย์แล้ว'};
+$('del').onclick=()=>{['gk','gm','gms'].forEach(k=>LS.del(k));KEY='';MODEL='';MODELS=[];$('key').value='';$('ks').textContent='ลบคีย์แล้ว'};
 function shrink(f){return new Promise((res,rej)=>{const fr=new FileReader();fr.onerror=rej;fr.onload=()=>{const im=new Image();im.onerror=rej;im.onload=()=>{const k=Math.min(1,1280/Math.max(im.width,im.height)),c=document.createElement('canvas');c.width=Math.round(im.width*k);c.height=Math.round(im.height*k);c.getContext('2d').drawImage(im,0,0,c.width,c.height);const u=c.toDataURL('image/jpeg',0.8);res({url:u,b64:u.split(',')[1]})};im.src=fr.result};fr.readAsDataURL(f)})}
 async function addFiles(l){for(const f of [...l]){if(files.length>=maxImg)break;try{files.push(await shrink(f))}catch(e){$('prog').textContent='อ่านรูปนี้ไม่ได้ (รองรับ JPG/PNG)'}}drawThumbs()}
 function drawThumbs(){$('thumbs').innerHTML='';files.forEach((f,i)=>{const s=document.createElement('span'),im=new Image(),b=document.createElement('b');im.src=f.url;b.textContent='×';b.onclick=()=>{files.splice(i,1);drawThumbs()};s.append(im,b);$('thumbs').append(s)})}
@@ -128,7 +152,7 @@ $('camIn').onchange=e=>{addFiles(e.target.files);e.target.value=''};$('pickIn').
 $('reset').onclick=()=>{ctl&&ctl.abort();files=[];extra=[];['txt','f1','f2','f3','f4'].forEach(i=>$(i).value='');drawThumbs();$('out').innerHTML='';$('prog').textContent=''};
 $('stop').onclick=()=>ctl&&ctl.abort();
 
-const ERR={key:'คีย์ไม่ถูกต้องหรือไม่มีสิทธิ์ ตรวจคีย์ในการตั้งค่า',rate:'ใช้ครบโควตาฟรีชั่วคราว รอสักครู่แล้วลองใหม่',net:'เชื่อมต่อ Gemini ไม่ได้ (เน็ตหลุดหรือเบราว์เซอร์บล็อก) ลองใหม่หรือเปลี่ยนเบราว์เซอร์',nomodel:'ไม่พบโมเดลที่ใช้ได้กับคีย์นี้',http:'Gemini ตอบกลับผิดปกติ ลองใหม่อีกครั้ง',empty:'Gemini ไม่ตอบกลับ (อาจถูกกรองเนื้อหา) ลองปรับข้อความ',json:'Gemini ตอบรูปแบบที่อ่านไม่ได้ กดวิเคราะห์อีกครั้ง'};
+const ERR={key:'คีย์ไม่ถูกต้องหรือไม่มีสิทธิ์ ตรวจคีย์ในการตั้งค่า',rate:'ใช้ครบโควตาฟรีชั่วคราว รอสักครู่แล้วลองใหม่',net:'เชื่อมต่อ Gemini ไม่ได้ (เน็ตหลุดหรือเบราว์เซอร์บล็อก) ลองใหม่หรือเปลี่ยนเบราว์เซอร์',nomodel:'ไม่พบโมเดลที่ใช้ได้กับคีย์นี้',busy:'โมเดลของ Google มีผู้ใช้หนาแน่น ลองซ้ำและสลับโมเดลสำรองแล้วยังไม่ได้ รอสักครู่แล้วกดวิเคราะห์ใหม่',http:'Gemini ตอบกลับผิดปกติ ลองใหม่อีกครั้ง',busy:'Gemini คนใช้งานหนาแน่นทุกโมเดลที่ลองแล้ว รอสักครู่แล้วลองใหม่',empty:'Gemini ไม่ตอบกลับ (อาจถูกกรองเนื้อหา) ลองปรับข้อความ',json:'Gemini ตอบรูปแบบที่อ่านไม่ได้ กดวิเคราะห์อีกครั้ง'};
 
 function gather(){
   const t=[];const m={f1:'วัสดุ/ส่วนประกอบ',f2:'การใช้งาน',f3:'สภาพสินค้า',f4:'ประเทศผู้ผลิต'};
@@ -153,28 +177,25 @@ CHAPTERS:
 ${ch}
 OFFICER DATA:
 ${txt||'(none, images only)'}`}
-function chapBlock(no){
-  const c=D.c[no],sec=D.s[D.sc[no]];
-  const hs=Object.keys(D.h).filter(h=>D.h[h][0]==no).sort().map(h=>h+' '+D.h[h][1].slice(0,160)).join('\n');
-  return `## Chapter ${no} ${c[0]}\nNOTES (may be truncated):\n${c[1].slice(0,6000)}\nSECTION NOTES: ${sec?sec[1].slice(0,2000):''}\nHEADINGS:\n${hs}`}
-function pB(A,chs){return `You assist a Thai customs officer. Product so far (JSON):\n${JSON.stringify({summary:A.summary,observed:A.observed,inferred:A.inferred,unknown:A.unknown,conflicts:A.conflicts})}
-TASK: Using the chapter notes and heading texts below, choose up to 3 headings that could apply. Check the notes for exclusions (e.g. not covered / see other heading) and mention them. If the product cannot be placed in a heading without more facts, return status "ask" with 1-3 questions whose options reflect real distinctions in the headings. Never give a final code here.
-${FMT}
-Shape: {"status":"ok"|"ask","headings":[{"code":"03.03","why":"","notes":""}],"questions":[{"q":"","why":"","options":[""]}]}
-${chs.map(chapBlock).join('\n\n')}`}
-function pC(A,B,hs){
-  const L=hs.map(h=>'### Heading '+h+' '+hdesc(h)+'\n'+(byHead[h]||[]).filter(r=>r[2]===1).map(r=>r[3]+' | '+path(r).slice(-3).join(' > ').slice(0,230)+' | '+r[5]).join('\n')).join('\n\n');
-  return `You assist a Thai customs officer. Product (JSON):\n${JSON.stringify({summary:A.summary,observed:A.observed,inferred:A.inferred,unknown:A.unknown,conflicts:A.conflicts})}
-Heading analysis: ${JSON.stringify(B.headings)}
-TASK: Choose the single 8-digit tariff code from the lists below (code | path | duty rate). Use only codes in the lists.
-- If a fact you do not have would decide between codes, return status "ask" (1-3 specific questions with options) and NO code at all.
+const heads=no=>Object.keys(D.h).filter(h=>D.h[h][0]==no).sort();
+const leafLines=h=>(byHead[h]||[]).filter(r=>r[2]===1).map(r=>r[3]+' | '+path(r).slice(-2).join(' > ').slice(0,150)+' | '+r[5]).join('\n');
+const chapNotes=no=>{const c=D.c[no],sec=D.s[D.sc[no]];return `## Chapter ${no} ${c[0]}\nNOTES (may be truncated):\n${c[1].slice(0,4500)}\nSECTION NOTES: ${sec?sec[1].slice(0,1500):''}`};
+const heading=h=>'### Heading '+h+' '+hdesc(h).slice(0,120);
+const prodJ=A=>JSON.stringify({summary:A.summary,observed:A.observed,inferred:A.inferred,unknown:A.unknown,conflicts:A.conflicts});
+const FIN=`- If a fact you do not have would decide between codes, return status "ask" (1-3 specific questions with options) and NO code at all.
 - If the image evidence and the officer's text point to different codes, return status "conflict" with one code per source and the reason.
 - Otherwise status "answer": one code, reasons, which chapter notes you relied on, alternatives with the condition under which they apply, and remaining unknowns.
 ${FMT}
-Shape: {"status":"answer"|"ask"|"conflict","answer":{"code":"","reasoning":[],"notes_used":[{"chapter":0,"point":""}],"alternatives":[{"code":"","when":""}],"unknown":[]},"conflict":{"issue":"","by_image":{"code":"","reason":""},"by_text":{"code":"","reason":""}},"questions":[{"q":"","why":"","options":[""]}]}
-${L}`}
+Shape: {"status":"answer"|"ask"|"conflict","answer":{"code":"","reasoning":[],"notes_used":[{"chapter":0,"point":""}],"alternatives":[{"code":"","when":""}],"unknown":[]},"conflict":{"issue":"","by_image":{"code":"","reason":""},"by_text":{"code":"","reason":""}},"questions":[{"q":"","why":"","options":[""]}]}`;
+function pB(A,chs){return `You assist a Thai customs officer. Product so far (JSON):\n${prodJ(A)}\nTASK: Using the chapter notes and heading texts below, choose up to 3 headings that could apply. Check the notes for exclusions and mention them. If the product cannot be placed in a heading without more facts, return status "ask" with 1-3 questions whose options reflect real distinctions in the headings. Never give a final code here.\n${FMT}\nShape: {"status":"ok"|"ask","headings":[{"code":"03.03","why":"","notes":""}],"questions":[{"q":"","why":"","options":[""]}]}\n${chs.map(no=>chapNotes(no)+'\nHEADINGS:\n'+heads(no).map(h=>h+' '+hdesc(h).slice(0,120)).join('\n')).join('\n\n')}`}
+function pC(A,B,hs){return `You assist a Thai customs officer. Product (JSON):\n${prodJ(A)}\nHeading analysis: ${JSON.stringify(B.headings)}\nTASK: Choose the single 8-digit tariff code from the lists below (code | path | duty rate). Use only codes in the lists.\n${FIN}\n${hs.map(h=>heading(h)+'\n'+leafLines(h)).join('\n\n')}`}
+function pM(A,chs){return `You assist a Thai customs officer. Product (JSON):\n${prodJ(A)}\nTASK: Read the chapter notes (check for exclusions), then choose the single 8-digit tariff code from the heading lists below (code | path | duty rate). Use only codes in the lists.\n${FIN}\n${chs.map(no=>chapNotes(no)+'\nCODES BY HEADING:\n'+heads(no).map(h=>heading(h)+'\n'+leafLines(h)).join('\n')).join('\n\n')}`}
+const lsize=chs=>chs.reduce((n,no)=>n+heads(no).reduce((m,h)=>m+leafLines(h).length,0),0);
 
-const step=(i,t)=>{$('prog').textContent='ขั้นที่ '+i+'/3 '+t+' (อาจใช้เวลาครึ่งนาทีขึ้นไป)…'};
+let tmr;
+const step=(i,t,n)=>{clearInterval(tmr);const t0=Date.now(),f=()=>{$('prog').textContent='ขั้นที่ '+i+'/'+(n||3)+' '+t+' · '+Math.round((Date.now()-t0)/1000)+' วินาที'};f();tmr=setInterval(f,1000)};
+const done=()=>{clearInterval(tmr);$('prog').textContent=''};
+const addLog=()=>{if(!TL.length)return;$('out').insertAdjacentHTML('beforeend','<details class="card"><summary>รายละเอียดเวลาและโทเคน (ใช้ตรวจว่าช้าตรงไหน)</summary>'+UL(TL.map(x=>x.l+': '+Math.round(x.ms/1000)+' วินาที · '+x.m+' · โทเคนเข้า '+(x.pt||'?')+' / คิด '+(x.th||0)+' / ออก '+(x.ot||'?')))+'</details>')};
 function facts(A){return `<div class="card"><h2>สิ่งที่เข้าใจจากข้อมูลที่ให้</h2><p>${E(A.summary)}</p>${A.observed&&A.observed.length?'<b>ระบุไว้/เห็นได้</b>'+UL(A.observed):''}${A.inferred&&A.inferred.length?'<b>คาดเดา (ยังไม่ยืนยัน)</b>'+UL(A.inferred):''}${A.conflicts&&A.conflicts.length?'<div class="card warn"><b>ข้อมูลขัดแย้งกัน</b>'+UL(A.conflicts.map(c=>'ภาพ: '+c.image+' / ข้อความ: '+c.text))+'</div>':''}</div>`}
 function showAsk(R,A){
   const qs=(R.questions||[]).slice(0,3);
@@ -197,22 +218,27 @@ function showFinal(F,A){
 }
 async function run(){
   if(!KEY||!MODEL){$('set').open=true;$('ks').textContent='ใส่และทดสอบคีย์ Gemini ก่อน';return}
-  ctl=new AbortController();$('run').disabled=true;$('stop').hidden=false;$('out').innerHTML='';
+  ctl=new AbortController();TL=[];$('run').disabled=true;$('stop').hidden=false;$('out').innerHTML='';
   try{
     const txt=gather();if(!txt&&!files.length){$('prog').textContent='ใส่ข้อความหรือรูปอย่างน้อยหนึ่งอย่าง';return}
-    step(1,'วิเคราะห์สินค้า');const A=await callModel(pA(txt,files.length),files.map(f=>f.b64));
-    if(A.status==='ask'||!(A.chapters||[]).length){showAsk(A,A);$('prog').textContent='';return}
+    step(1,'วิเคราะห์สินค้า');const A=await callModel(pA(txt,files.length),files.map(f=>f.b64),'ขั้น 1 วิเคราะห์สินค้า');
+    if(A.status==='ask'||!(A.chapters||[]).length){done();showAsk(A,A);addLog();return}
     const chs=[...new Set(A.chapters.map(c=>+c.no).filter(n=>D.c[n]))].slice(0,3);
-    step(2,'ตรวจหมายเหตุและเลือกประเภท');const B=await callModel(pB(A,chs));
-    const hs=[...new Set((B.headings||[]).map(x=>x.code).filter(h=>byHead[h]))].slice(0,3);
-    if(B.status==='ask'||!hs.length){showAsk(B,A);$('prog').textContent='';return}
-    step(3,'เลือกรหัสจากรายการย่อย');const F=await callModel(pC(A,B,hs));
-    if(F.status==='ask'){showAsk(F,A)}else showFinal(F,A);
-    $('prog').textContent='';
+    let use=null;for(const k of [3,2,1]){const c=chs.slice(0,k);if(c.length&&lsize(c)<=40000){use=c;break}}
+    let F;
+    if(use){step(2,'ตรวจหมายเหตุและเลือกรหัส',2);F=await callModel(pM(A,use),null,'ขั้น 2 เลือกรหัส (รวมสองขั้น)')}
+    else{
+      step(2,'ตรวจหมายเหตุและเลือกประเภท');const B=await callModel(pB(A,chs),null,'ขั้น 2 เลือกประเภท');
+      const hs=[...new Set((B.headings||[]).map(x=>x.code).filter(h=>byHead[h]))].slice(0,3);
+      if(B.status==='ask'||!hs.length){done();showAsk(B,A);addLog();return}
+      step(3,'เลือกรหัสจากรายการย่อย');F=await callModel(pC(A,B,hs),null,'ขั้น 3 เลือกรหัส')}
+    done();if(F.status==='ask'){showAsk(F,A)}else showFinal(F,A);
+    addLog();
   }catch(e){
+    clearInterval(tmr);
     if(e&&e.name==='AbortError'){$('prog').textContent='หยุดแล้ว'}
     else $('prog').textContent=((e&&ERR[e.code])||'เกิดข้อผิดพลาด ลองกดวิเคราะห์อีกครั้ง')+(e&&e.msg?' ['+e.msg.slice(0,140)+']':'');
-  }finally{$('run').disabled=false;$('stop').hidden=true}
+  }finally{clearInterval(tmr);$('run').disabled=false;$('stop').hidden=true}
 }
 $('run').onclick=run;
 </script></body></html>
