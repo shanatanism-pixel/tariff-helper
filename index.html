@@ -71,6 +71,7 @@ ul{margin:.3em 0;padding-left:1.2em}
 <p class="note">เวอร์ชันนี้ใช้ได้เฉพาะ Gemini และยังค้นเว็บภายนอกไม่ได้ ระดับฟรีของ Google อาจนำข้อมูลที่ส่งไปปรับปรุงผลิตภัณฑ์ <b>ห้ามใส่ข้อมูลลับของงาน</b></p>
 <div class="row" style="margin-top:10px"><button class="go" id="run">วิเคราะห์พิกัด</button><button id="stop" hidden>หยุด</button><button id="reset">เริ่มใหม่</button></div>
 <p class="note" id="prog" role="status"></p>
+<p class="note">ระหว่างวิเคราะห์ ระบบกันหน้าจอไม่ให้ดับ และจดจำงานไว้ในเครื่อง ถ้าหน้าถูกโหลดใหม่จะทำต่อให้เอง (เก็บไว้ไม่เกิน 1 ชั่วโมง กด “เริ่มใหม่” เพื่อลบทันที)</p>
 </section>
 <div id="out"></div>
 </main>
@@ -129,6 +130,7 @@ async function callModel(prompt,imgs,label){
         last=e;if(e.name==='AbortError')throw e;
         if(e.status===400&&/think/i.test(e.msg||'')&&!NOTHINK){NOTHINK=true;k--;continue}
         if(e.code==='busy'&&k===0){await sleep(2500);continue}
+        if(e.code==='net'&&k===0){await vis();await sleep(800);continue}
         break;
       }
     }
@@ -216,29 +218,53 @@ function showFinal(F,A){
     h+=`<div class="card ans"><h2>พิกัดที่ควรใช้</h2>${codeCard(a.code,'')}<b>เหตุผล</b>${UL(a.reasoning)}${a.notes_used&&a.notes_used.length?'<b>หมายเหตุที่ใช้ประกอบ</b>'+UL(a.notes_used.map(n=>{const c=D.c[n.chapter];return 'ตอนที่ '+n.chapter+': '+n.point+(c?' (หน้า PDF '+c[2]+'–'+c[3]+')':'')})):''}${a.alternatives&&a.alternatives.length?'<b>ตัวเลือกรอง</b>'+UL(a.alternatives.map(x=>x.code+' ถ้า'+x.when)):''}${a.unknown&&a.unknown.length?'<b>ยังไม่ทราบ (อาจเปลี่ยนผล)</b>'+UL(a.unknown):''}<div class="src"><span class="tag">ผู้ใช้</span>ข้อความและรูปที่ใส่ · <span class="tag">AI</span>Gemini วิเคราะห์ · ไม่ได้ใช้ข้อมูลจากเว็บภายนอก</div></div>`}
   $('out').innerHTML=h;
 }
-async function run(){
+// ---- keep screen awake + remember the job so a reload resumes it ----
+let RUN=false,wl=null;
+async function lockOn(){try{if(typeof navigator!=='undefined'&&navigator.wakeLock&&!wl){wl=await navigator.wakeLock.request('screen');wl.addEventListener('release',()=>{wl=null})}}catch(e){}}
+function lockOff(){try{wl&&wl.release()}catch(e){}wl=null}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&RUN)lockOn()});
+const vis=()=>document.visibilityState!=='hidden'?Promise.resolve():new Promise(r=>{const f=()=>{if(document.visibilityState!=='hidden'){document.removeEventListener('visibilitychange',f);r()}};document.addEventListener('visibilitychange',f)});
+const IDB={db:null,open(){return this.db||(this.db=new Promise((res,rej)=>{const q=indexedDB.open('tariff',1);q.onupgradeneeded=()=>q.result.createObjectStore('j');q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error)}))},
+  async get(){try{const d=await this.open();return await new Promise(r=>{const q=d.transaction('j').objectStore('j').get('job');q.onsuccess=()=>r(q.result);q.onerror=()=>r(null)})}catch(e){return null}},
+  async put(v){try{const d=await this.open();await new Promise(r=>{const t=d.transaction('j','readwrite');if(v===null)t.objectStore('j').delete('job');else t.objectStore('j').put(v,'job');t.oncomplete=r;t.onerror=r;t.onabort=r})}catch(e){}}};
+const _rs=$('reset').onclick;$('reset').onclick=()=>{_rs();IDB.put(null)};
+async function finish(job,kind,R,A){done();if(kind==='final')showFinal(R,A);else showAsk(R,A);addLog();job.status='done';job.result={kind,R,A};await IDB.put(job)}
+async function run(job){
   if(!KEY||!MODEL){$('set').open=true;$('ks').textContent='ใส่และทดสอบคีย์ Gemini ก่อน';return}
-  ctl=new AbortController();TL=[];$('run').disabled=true;$('stop').hidden=false;$('out').innerHTML='';
+  RUN=true;ctl=new AbortController();TL=[];$('run').disabled=true;$('stop').hidden=false;$('out').innerHTML='';lockOn();
   try{
-    const txt=gather();if(!txt&&!files.length){$('prog').textContent='ใส่ข้อความหรือรูปอย่างน้อยหนึ่งอย่าง';return}
-    step(1,'วิเคราะห์สินค้า');const A=await callModel(pA(txt,files.length),files.map(f=>f.b64),'ขั้น 1 วิเคราะห์สินค้า');
-    if(A.status==='ask'||!(A.chapters||[]).length){done();showAsk(A,A);addLog();return}
+    if(!job){
+      if(!gather()&&!files.length){$('prog').textContent='ใส่ข้อความหรือรูปอย่างน้อยหนึ่งอย่าง';return}
+      job={t:Date.now(),status:'running',f:{txt:$('txt').value,f1:$('f1').value,f2:$('f2').value,f3:$('f3').value,f4:$('f4').value},extra:[...extra],files:files.slice()};await IDB.put(job)}
+    const txt=gather();
+    let A=job.A;
+    if(!A){step(1,'วิเคราะห์สินค้า');A=await callModel(pA(txt,files.length),files.map(f=>f.b64),'ขั้น 1 วิเคราะห์สินค้า');job.A=A;await IDB.put(job)}
+    if(A.status==='ask'||!(A.chapters||[]).length){await finish(job,'ask',A,A);return}
     const chs=[...new Set(A.chapters.map(c=>+c.no).filter(n=>D.c[n]))].slice(0,3);
     let use=null;for(const k of [3,2,1]){const c=chs.slice(0,k);if(c.length&&lsize(c)<=40000){use=c;break}}
-    let F;
-    if(use){step(2,'ตรวจหมายเหตุและเลือกรหัส',2);F=await callModel(pM(A,use),null,'ขั้น 2 เลือกรหัส (รวมสองขั้น)')}
-    else{
-      step(2,'ตรวจหมายเหตุและเลือกประเภท');const B=await callModel(pB(A,chs),null,'ขั้น 2 เลือกประเภท');
-      const hs=[...new Set((B.headings||[]).map(x=>x.code).filter(h=>byHead[h]))].slice(0,3);
-      if(B.status==='ask'||!hs.length){done();showAsk(B,A);addLog();return}
-      step(3,'เลือกรหัสจากรายการย่อย');F=await callModel(pC(A,B,hs),null,'ขั้น 3 เลือกรหัส')}
-    done();if(F.status==='ask'){showAsk(F,A)}else showFinal(F,A);
-    addLog();
+    let F=job.F;
+    if(!F){
+      if(use){step(2,'ตรวจหมายเหตุและเลือกรหัส',2);F=await callModel(pM(A,use),null,'ขั้น 2 เลือกรหัส (รวมสองขั้น)')}
+      else{
+        let B=job.B;if(!B){step(2,'ตรวจหมายเหตุและเลือกประเภท');B=await callModel(pB(A,chs),null,'ขั้น 2 เลือกประเภท');job.B=B;await IDB.put(job)}
+        const hs=[...new Set((B.headings||[]).map(x=>x.code).filter(h=>byHead[h]))].slice(0,3);
+        if(B.status==='ask'||!hs.length){await finish(job,'ask',B,A);return}
+        step(3,'เลือกรหัสจากรายการย่อย');F=await callModel(pC(A,B,hs),null,'ขั้น 3 เลือกรหัส')}
+      job.F=F;await IDB.put(job)}
+    await finish(job,F.status==='ask'?'ask':'final',F,A);
   }catch(e){
     clearInterval(tmr);
-    if(e&&e.name==='AbortError'){$('prog').textContent='หยุดแล้ว'}
-    else $('prog').textContent=((e&&ERR[e.code])||'เกิดข้อผิดพลาด ลองกดวิเคราะห์อีกครั้ง')+(e&&e.msg?' ['+e.msg.slice(0,140)+']':'');
-  }finally{clearInterval(tmr);$('run').disabled=false;$('stop').hidden=true}
+    if(e&&e.name==='AbortError'){$('prog').textContent='หยุดแล้ว';if(job){job.status='stopped';IDB.put(job)}}
+    else{$('prog').textContent=((e&&ERR[e.code])||'เกิดข้อผิดพลาด ลองกดวิเคราะห์อีกครั้ง')+(e&&e.msg?' ['+e.msg.slice(0,140)+']':'');if(job){job.status='error';IDB.put(job)}}
+  }finally{RUN=false;lockOff();clearInterval(tmr);$('run').disabled=false;$('stop').hidden=true}
 }
-$('run').onclick=run;
+$('run').onclick=()=>run();
+async function restore(){
+  const j=await IDB.get();if(!j)return;const age=Date.now()-j.t;
+  if(age>3600000){IDB.put(null);return}
+  $('txt').value=j.f.txt||'';['f1','f2','f3','f4'].forEach(k=>{$(k).value=j.f[k]||''});extra=j.extra||[];files=j.files||[];drawThumbs();
+  if(j.status==='running'&&age<1200000){$('prog').textContent='กู้คืนงานที่ค้างอยู่ กำลังทำต่อให้อัตโนมัติ…';run(j)}
+  else if(j.status==='done'&&j.result){const r=j.result;if(r.kind==='final')showFinal(r.R,r.A);else showAsk(r.R,r.A)}
+}
+restore();
 </script></body></html>
